@@ -53,18 +53,24 @@ Gap detection is read-only and does not mutate money-path state. If a
 regression is detected, disable the detector via its feature flag and
 fall back to the previous behavior; no mainnet state is affected.
 
-## Decimal Utils & Precision
+## Safe JSON Parsing & Serialization (`safeJson.ts`)
 
-`src/decimalUtils.ts` provides rigorous fixed-point arithmetic for on-chain collateral amounts (7 implicit decimals) and share quantities.
+`src/safeJson.ts` provides robust, production-grade JSON parsing (`safeJsonParse`)
+and sanitization/serialization (`safeStringify`, `sanitizeForJson`) with built-in
+protections against Denial of Service (DoS) and resource exhaustion attacks.
 
 ### Invariants
 
-- **Lossless Round-Tripping**: `amountRawToDecimal` and `decimalToAmountRaw` convert between on-chain `i128` integers and Prisma `Decimal(20, 8)` columns using integer arithmetic without floating-point loss.
-- **Strict Bounds & Scale Validation**: Inputs exceeding `Decimal(20,8)` range or carrying > 7 fractional digits are rejected with stable error codes.
-- **Safe Share Quantities**: `sharesRawToInt` validates share quantities against `0` and `Number.MAX_SAFE_INTEGER`, preventing silent truncation or overflow.
-- **Fail-Closed & Kill-Switch**: Operations are gated by feature flags (`DecimalUtilsFeatureFlags`) and emit correlation IDs and ops-safe metrics.
-
-See `docs/fixes/1101-indexer-decimal-utils-precision.md` for full design and rollback procedures.
+- **Maximum String Length**: Inputs exceeding `maxLength` (default: 1 MB) are
+  rejected immediately without parsing.
+- **Nesting Depth Limits**: JSON payloads or JavaScript objects exceeding
+  `maxDepth` (default: 32 levels) are rejected or truncated to prevent stack
+  overflow (`RangeError`).
+- **Array & Object Size Limits**: Arrays exceeding `maxArrayLength` (default: 10,000)
+  and objects exceeding `maxObjectKeys` (default: 10,000) are bounded or rejected.
+- **Fail-Closed on Malformed Input**: `safeJsonParse` never throws an uncaught
+  exception; it returns `{ ok: false, error: SyntaxError }` on any parsing or validation failure.
+- **Ops-Safe**: Secrets and raw credentials are never leaked in logs or error messages.
 
 ## Stellar Wave contributors
 
