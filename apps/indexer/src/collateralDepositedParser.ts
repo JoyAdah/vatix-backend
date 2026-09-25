@@ -1,11 +1,32 @@
 import { xdr, scValToNative } from "@stellar/stellar-sdk";
-import type { RawChainEvent } from "./types.js";
+import type { RawChainEvent, NormalizedCollateralDeposit } from "./types.js";
 import { CollateralDepositedParseError } from "./types.js";
 import { safeStringify } from "./safeJson.js";
 import type { Telemetry } from "./telemetry.js";
 import { amountRawToDecimal } from "./decimalUtils.js";
 
 const COLLATERAL_DEPOSITED_TOPIC = "collateral_deposited";
+
+/**
+ * Stable error codes for collateral-deposit parsing. These are part of the
+ * parser's public contract: downstream consumers (indexer pipeline, ops
+ * dashboards, alerting) key off these codes, so they must not change
+ * without a coordinated migration.
+ */
+export const CollateralDepositedErrorCode = {
+  WRONG_TOPIC: "COLLATERAL_WRONG_TOPIC",
+  BAD_VALUE_XDR: "COLLATERAL_BAD_VALUE_XDR",
+  VALUE_NOT_TUPLE: "COLLATERAL_VALUE_NOT_TUPLE",
+  BAD_ACCOUNT: "COLLATERAL_BAD_ACCOUNT",
+  BAD_BIGINT: "COLLATERAL_BAD_BIGINT",
+  NUMBER_NOT_I128: "COLLATERAL_NUMBER_NOT_I128",
+  NEGATIVE_AMOUNT: "COLLATERAL_NEGATIVE_AMOUNT",
+  ZERO_AMOUNT: "COLLATERAL_ZERO_AMOUNT",
+  SCALE_EXCEEDED: "COLLATERAL_SCALE_EXCEEDED",
+} as const;
+
+export type CollateralDepositedErrorCode =
+  (typeof CollateralDepositedErrorCode)[keyof typeof CollateralDepositedErrorCode];
 
 function isProductionEnv(nodeEnv: string): boolean {
   return nodeEnv === "production";
@@ -30,29 +51,6 @@ function isCollateralDepositedEvent(topicsXdr: string[]): boolean {
   }
 }
 
-/**
- * Normalized collateral deposit record.
- *
- * Contract emits a 3-element Vec:
- *   [account: ScvString, market_id: ScvU32, amount: ScvI128]
- */
-export interface NormalizedCollateralDeposit {
-  eventId: string;
-  ledger: number;
-  ledgerClosedAt: string;
-  contractId: string;
-  /** Stellar account that deposited collateral. */
-  account: string;
-  /** Numeric market identifier (u32 cast to string for DB compat). */
-  marketId: string;
-  /**
-   * Deposit amount in base units (i128, 7 implicit decimal places).
-   * e.g. 10_000_000n == 1.0 collateral unit.
-   * Use `amountRawToDecimal(amountRaw)` to convert to a Prisma Decimal.
-   */
-  amountRaw: bigint;
-}
-
 function toBigInt(
   value: unknown,
   fieldName: string,
@@ -71,7 +69,9 @@ function toBigInt(
       throw new CollateralDepositedParseError(
         `Field "${fieldName}" decoded as a plain number, not an i128 bigint — ` +
           "refusing to guess the on-chain scale in production",
-        eventId
+        eventId,
+        undefined,
+        CollateralDepositedErrorCode.NUMBER_NOT_I128
       );
     }
     return BigInt(value);
@@ -85,7 +85,9 @@ function toBigInt(
   }
   throw new CollateralDepositedParseError(
     `Field "${fieldName}" cannot be converted to bigint: ${String(value)}`,
-    eventId
+    eventId,
+    undefined,
+    CollateralDepositedErrorCode.BAD_BIGINT
   );
 }
 
@@ -102,7 +104,11 @@ function validateCollateralScale(amountRaw: bigint, eventId: string): void {
   if (amountRaw <= 0n) {
     throw new CollateralDepositedParseError(
       `Field "amount" must be a positive i128, got ${amountRaw}`,
-      eventId
+      eventId,
+      undefined,
+      amountRaw === 0n
+        ? CollateralDepositedErrorCode.ZERO_AMOUNT
+        : CollateralDepositedErrorCode.NEGATIVE_AMOUNT
     );
   }
   try {
@@ -111,7 +117,9 @@ function validateCollateralScale(amountRaw: bigint, eventId: string): void {
     throw new CollateralDepositedParseError(
       `Field "amount" (${amountRaw}) is out of range for the 7-decimal ` +
         `collateral scale: ${err instanceof Error ? err.message : String(err)}`,
-      eventId
+      eventId,
+      err,
+      CollateralDepositedErrorCode.SCALE_EXCEEDED
     );
   }
 }
@@ -139,7 +147,9 @@ export function parseCollateralDepositedEvent(
   if (!isCollateralDepositedEvent(event.topicsXdr)) {
     throw new CollateralDepositedParseError(
       `Event topic is not "${COLLATERAL_DEPOSITED_TOPIC}"`,
-      event.id
+      event.id,
+      undefined,
+      CollateralDepositedErrorCode.WRONG_TOPIC
     );
   }
 
@@ -150,14 +160,17 @@ export function parseCollateralDepositedEvent(
     throw new CollateralDepositedParseError(
       "Failed to decode event value XDR",
       event.id,
-      err
+      err,
+      CollateralDepositedErrorCode.BAD_VALUE_XDR
     );
   }
 
   if (!Array.isArray(decoded) || decoded.length < 3) {
     throw new CollateralDepositedParseError(
       `collateral_deposited payload must be a 3-element tuple, got: ${formatDecodedValue(decoded)}`,
-      event.id
+      event.id,
+      undefined,
+      CollateralDepositedErrorCode.VALUE_NOT_TUPLE
     );
   }
 
@@ -166,7 +179,9 @@ export function parseCollateralDepositedEvent(
   if (typeof account !== "string") {
     throw new CollateralDepositedParseError(
       `Field "account" must be a string, got ${typeof account}`,
-      event.id
+      event.id,
+      undefined,
+      CollateralDepositedErrorCode.BAD_ACCOUNT
     );
   }
 
@@ -221,7 +236,7 @@ export function parseCollateralDepositedEvents(
       errors.push(
         err instanceof CollateralDepositedParseError
           ? err
-          : new CollateralDepositedParseError(String(err), event.id, err)
+          : new CollateralDepositedParseError(String(err), event.id, err, CollateralDepositedErrorCode.BAD_VALUE_XDR)
       );
     }
   }
